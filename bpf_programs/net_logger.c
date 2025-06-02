@@ -88,7 +88,7 @@ int kprobe__tcp_sendmsg(struct pt_regs *ctx, struct sock *sk, struct msghdr *msg
     conn_info.dport = ntohs(dport);
     conn_info.proto = 6;
     conn_info.len = size;
-    
+
     bpf_get_current_comm(&conn_info.comm, sizeof(conn_info.comm));
     
     conn_events.perf_submit(ctx, &conn_info, sizeof(conn_info));
@@ -115,8 +115,8 @@ int kprobe__udp_sendmsg(struct pt_regs *ctx, struct sock *sk, struct msghdr *msg
     conn_info.daddr = daddr;
     conn_info.sport = ntohs(sport);
     conn_info.dport = ntohs(dport);
-    conn_info.proto = 17;  // IPPROTO_UDP
-    conn_info.len = len;   // Set packet length from function parameter
+    conn_info.proto = 17;
+    conn_info.len = len;
     
     bpf_get_current_comm(&conn_info.comm, sizeof(conn_info.comm));
     
@@ -132,6 +132,9 @@ int kprobe__ping_v4_sendmsg(struct pt_regs *ctx, struct sock *sk, struct msghdr 
         
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
+    
+    if (pid == 0)
+        return 0;
     
     u32 saddr = sk->__sk_common.skc_rcv_saddr;
     u32 daddr = sk->__sk_common.skc_daddr;

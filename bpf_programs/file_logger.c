@@ -1,7 +1,6 @@
 #include <uapi/linux/ptrace.h>
 #include <linux/sched.h>
 #include <linux/fs.h>
-#include <linux/dcache.h>
 
 #define TASK_COMM_LEN 16
 
@@ -10,7 +9,6 @@ struct file_data_t {
     char comm[TASK_COMM_LEN];
     char fname[256];
     char operation[16];
-    u8 is_dir;
 };
 
 struct fd_key_t {
@@ -18,16 +16,23 @@ struct fd_key_t {
     u32 fd;
 };
 
-BPF_HASH(active_opens, u64, struct file_data_t);
+BPF_HASH(active_opens, u64, struct file_data_t, 1024);
 
-BPF_HASH(fd_info, struct fd_key_t, struct file_data_t);
+BPF_HASH(fd_info, struct fd_key_t, struct file_data_t, 4096);
 
 BPF_PERCPU_ARRAY(tmp_storage, struct file_data_t, 1);
 
 BPF_PERF_OUTPUT(file_events);
 
-static inline u64 gen_tgid_fd(u32 tgid, u32 pid) {
+static inline u64 gen_tgid_pid(u32 tgid, u32 pid) {
     return ((u64)tgid << 32) | pid;
+}
+
+static inline void copy_file_data(struct file_data_t *dest, struct file_data_t *src) {
+    dest->pid = src->pid;
+    __builtin_memcpy(dest->comm, src->comm, TASK_COMM_LEN);
+    __builtin_memcpy(dest->fname, src->fname, 256);
+    __builtin_memcpy(dest->operation, src->operation, 16);
 }
 
 TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
@@ -36,18 +41,28 @@ TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
     if (!data)
         return 0;
     
+    __builtin_memset(data, 0, sizeof(*data));
+    
     u64 pid_tgid = bpf_get_current_pid_tgid();
-    data->pid = pid_tgid >> 32;
+    u32 tgid = pid_tgid >> 32;
+    u32 pid = pid_tgid & 0xFFFFFFFF;
+    
+    data->pid = tgid;
     
     bpf_get_current_comm(&data->comm, sizeof(data->comm));
     
-    bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->filename);
+    if (args->filename) {
+        int ret = bpf_probe_read_user_str(&data->fname, sizeof(data->fname), (void *)args->filename);
+        if (ret < 0) {
+            bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->filename);
+        }
+    } else {
+        data->fname[0] = '\0';
+    }
     
     __builtin_memcpy(&data->operation, "open", 5);
     
-    data->is_dir = (args->flags & O_DIRECTORY) ? 1 : 0;
-    
-    u64 key = gen_tgid_fd(data->pid, pid_tgid & 0xFFFFFFFF);
+    u64 key = gen_tgid_pid(tgid, pid);
     active_opens.update(&key, data);
     
     file_events.perf_submit(args, data, sizeof(*data));
@@ -55,24 +70,139 @@ TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
     return 0;
 }
 
-TRACEPOINT_PROBE(syscalls, sys_exit_openat) {
-    if (args->ret >= 0) {
-        u64 pid_tgid = bpf_get_current_pid_tgid();
-        u32 pid = pid_tgid >> 32;
-        u32 tid = pid_tgid & 0xFFFFFFFF;
-        u64 key = gen_tgid_fd(pid, tid);
-        
-        struct file_data_t *data = active_opens.lookup(&key);
-        if (data != NULL) {
-            struct fd_key_t fd_key = {
-                .pid = pid,
-                .fd = (u32)args->ret
-            };
-            
-            fd_info.update(&fd_key, data);
-            
-            active_opens.delete(&key);
+TRACEPOINT_PROBE(syscalls, sys_enter_truncate) {
+    u32 zero = 0;
+    struct file_data_t *data = tmp_storage.lookup(&zero);
+    if (!data)
+        return 0;
+    
+    __builtin_memset(data, 0, sizeof(*data));
+    
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    data->pid = pid_tgid >> 32;
+    
+    bpf_get_current_comm(&data->comm, sizeof(data->comm));
+    
+    if (args->path) {
+        int ret = bpf_probe_read_user_str(&data->fname, sizeof(data->fname), (void *)args->path);
+        if (ret < 0) {
+            bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->path);
         }
+    }
+    
+    __builtin_memcpy(&data->operation, "truncate", 9);
+    
+    file_events.perf_submit(args, data, sizeof(*data));
+    
+    return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_enter_ftruncate) {
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 tgid = pid_tgid >> 32;
+    
+    struct fd_key_t key = {};
+    key.pid = tgid;
+    key.fd = (u32)args->fd;
+    
+    struct file_data_t *info = fd_info.lookup(&key);
+    if (!info) {
+        return 0;
+    }
+    
+    u32 zero = 0;
+    struct file_data_t *data = tmp_storage.lookup(&zero);
+    if (!data) {
+        return 0;
+    }
+    
+    copy_file_data(data, info);
+    
+    __builtin_memcpy(&data->operation, "truncate", 9);
+    bpf_get_current_comm(&data->comm, sizeof(data->comm));
+    
+    file_events.perf_submit(args, data, sizeof(*data));
+    
+    return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_exit_openat) {
+    if (args->ret < 0) {
+        return 0;
+    }
+    
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 tgid = pid_tgid >> 32;
+    u32 pid = pid_tgid & 0xFFFFFFFF;
+    u64 key = gen_tgid_pid(tgid, pid);
+    
+    struct file_data_t *stored_data = active_opens.lookup(&key);
+    if (stored_data) {
+        struct fd_key_t fd_key = {};
+        fd_key.pid = tgid;
+        fd_key.fd = (u32)args->ret;
+        
+        fd_info.update(&fd_key, stored_data);
+        
+        active_opens.delete(&key);
+    }
+    
+    return 0;
+}
+
+
+TRACEPOINT_PROBE(syscalls, sys_enter_open) {
+    u32 zero = 0;
+    struct file_data_t *data = tmp_storage.lookup(&zero);
+    if (!data)
+        return 0;
+    
+    __builtin_memset(data, 0, sizeof(*data));
+    
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 tgid = pid_tgid >> 32;
+    u32 pid = pid_tgid & 0xFFFFFFFF;
+    
+    data->pid = tgid;
+    bpf_get_current_comm(&data->comm, sizeof(data->comm));
+    
+    if (args->filename) {
+        int ret = bpf_probe_read_user_str(&data->fname, sizeof(data->fname), (void *)args->filename);
+        if (ret < 0) {
+            bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->filename);
+        }
+    } else {
+        data->fname[0] = '\0';
+    }
+    
+    __builtin_memcpy(&data->operation, "open", 5);
+    
+    u64 key = gen_tgid_pid(tgid, pid);
+    active_opens.update(&key, data);
+    
+    file_events.perf_submit(args, data, sizeof(*data));
+    
+    return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_exit_open) {
+    if (args->ret < 0) {
+        return 0;
+    }
+    
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 tgid = pid_tgid >> 32;
+    u32 pid = pid_tgid & 0xFFFFFFFF;
+    u64 key = gen_tgid_pid(tgid, pid);
+    
+    struct file_data_t *stored_data = active_opens.lookup(&key);
+    if (stored_data) {
+        struct fd_key_t fd_key = {};
+        fd_key.pid = tgid;
+        fd_key.fd = (u32)args->ret;
+        
+        fd_info.update(&fd_key, stored_data);
+        active_opens.delete(&key);
     }
     
     return 0;
@@ -80,70 +210,154 @@ TRACEPOINT_PROBE(syscalls, sys_exit_openat) {
 
 TRACEPOINT_PROBE(syscalls, sys_enter_read) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
-    u32 pid = pid_tgid >> 32;
+    u32 tgid = pid_tgid >> 32;
     
-    struct fd_key_t key = {
-        .pid = pid,
-        .fd = (u32)args->fd
-    };
+    if (args->fd <= 2) {
+        return 0;
+    }
+    
+    struct fd_key_t key = {};
+    key.pid = tgid;
+    key.fd = (u32)args->fd;
+    
+    struct file_data_t *info = fd_info.lookup(&key);
+    if (!info) {
+        return 0;
+    }
     
     u32 zero = 0;
     struct file_data_t *data = tmp_storage.lookup(&zero);
-    if (!data)
+    if (!data) {
         return 0;
-    
-    struct file_data_t *info = fd_info.lookup(&key);
-    if (info != NULL) {
-        __builtin_memcpy(data, info, sizeof(*data));
-        
-        __builtin_memcpy(&data->operation, "read", 5);
-        
-        bpf_get_current_comm(&data->comm, sizeof(data->comm));
-        
-        file_events.perf_submit(args, data, sizeof(*data));
     }
+    
+    copy_file_data(data, info);
+    
+    __builtin_memcpy(&data->operation, "read", 5);
+    bpf_get_current_comm(&data->comm, sizeof(data->comm));
+    
+    file_events.perf_submit(args, data, sizeof(*data));
     
     return 0;
 }
 
 TRACEPOINT_PROBE(syscalls, sys_enter_write) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
-    u32 pid = pid_tgid >> 32;
+    u32 tgid = pid_tgid >> 32;
     
-    struct fd_key_t key = {
-        .pid = pid,
-        .fd = (u32)args->fd
-    };
+    if (args->fd <= 2) {
+        return 0;
+    }
+    
+    struct fd_key_t key = {};
+    key.pid = tgid;
+    key.fd = (u32)args->fd;
+    
+    struct file_data_t *info = fd_info.lookup(&key);
+    if (!info) {
+        return 0;
+    }
     
     u32 zero = 0;
     struct file_data_t *data = tmp_storage.lookup(&zero);
-    if (!data)
+    if (!data) {
         return 0;
-    
-    struct file_data_t *info = fd_info.lookup(&key);
-    if (info != NULL) {
-        __builtin_memcpy(data, info, sizeof(*data));
-        
-        __builtin_memcpy(&data->operation, "write", 6);
-        
-        bpf_get_current_comm(&data->comm, sizeof(data->comm));
-        
-        file_events.perf_submit(args, data, sizeof(*data));
     }
+    
+    copy_file_data(data, info);
+    
+    __builtin_memcpy(&data->operation, "write", 6);
+    bpf_get_current_comm(&data->comm, sizeof(data->comm));
+    
+    file_events.perf_submit(args, data, sizeof(*data));
     
     return 0;
 }
 
 TRACEPOINT_PROBE(syscalls, sys_enter_close) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
-    u32 pid = pid_tgid >> 32;
+    u32 tgid = pid_tgid >> 32;
     
-    struct fd_key_t key = {
-        .pid = pid,
-        .fd = (u32)args->fd
-    };
+    if (args->fd <= 2) {
+        return 0;
+    }
+    
+    struct fd_key_t key = {};
+    key.pid = tgid;
+    key.fd = (u32)args->fd;
+
+    struct file_data_t *info = fd_info.lookup(&key);
+    if (info) {
+        u32 zero = 0;
+        struct file_data_t *data = tmp_storage.lookup(&zero);
+        if (data) {
+            copy_file_data(data, info);
+            __builtin_memcpy(&data->operation, "close", 6);
+            bpf_get_current_comm(&data->comm, sizeof(data->comm));
+            
+            file_events.perf_submit(args, data, sizeof(*data));
+        }
+    }
     
     fd_info.delete(&key);
+    
+    return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_enter_getdents64) {
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 tgid = pid_tgid >> 32;
+    
+    struct fd_key_t key = {};
+    key.pid = tgid;
+    key.fd = (u32)args->fd;
+    
+    struct file_data_t *info = fd_info.lookup(&key);
+    if (!info) {
+        return 0;
+    }
+    
+    u32 zero = 0;
+    struct file_data_t *data = tmp_storage.lookup(&zero);
+    if (!data) {
+        return 0;
+    }
+    
+    copy_file_data(data, info);
+    
+    __builtin_memcpy(&data->operation, "readdir", 8);
+    bpf_get_current_comm(&data->comm, sizeof(data->comm));
+    
+    file_events.perf_submit(args, data, sizeof(*data));
+    
+    return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_enter_getdents) {
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 tgid = pid_tgid >> 32;
+    
+    struct fd_key_t key = {};
+    key.pid = tgid;
+    key.fd = (u32)args->fd;
+    
+    struct file_data_t *info = fd_info.lookup(&key);
+    if (!info) {
+        return 0;
+    }
+    
+    u32 zero = 0;
+    struct file_data_t *data = tmp_storage.lookup(&zero);
+    if (!data) {
+        return 0;
+    }
+    
+    copy_file_data(data, info);
+    
+    __builtin_memcpy(&data->operation, "readdir", 8);
+    bpf_get_current_comm(&data->comm, sizeof(data->comm));
+    
+    file_events.perf_submit(args, data, sizeof(*data));
     
     return 0;
 }
@@ -154,12 +368,21 @@ TRACEPOINT_PROBE(syscalls, sys_enter_unlink) {
     if (!data)
         return 0;
     
-    data->pid = bpf_get_current_pid_tgid() >> 32;
+    __builtin_memset(data, 0, sizeof(*data));
+    
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    data->pid = pid_tgid >> 32;
     
     bpf_get_current_comm(&data->comm, sizeof(data->comm));
-    bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->pathname);
+    
+    if (args->pathname) {
+        int ret = bpf_probe_read_user_str(&data->fname, sizeof(data->fname), (void *)args->pathname);
+        if (ret < 0) {
+            bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->pathname);
+        }
+    }
+    
     __builtin_memcpy(&data->operation, "unlink", 7);
-    data->is_dir = 0;
     
     file_events.perf_submit(args, data, sizeof(*data));
     
@@ -172,72 +395,21 @@ TRACEPOINT_PROBE(syscalls, sys_enter_unlinkat) {
     if (!data)
         return 0;
     
-    data->pid = bpf_get_current_pid_tgid() >> 32;
+    __builtin_memset(data, 0, sizeof(*data));
+    
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    data->pid = pid_tgid >> 32;
     
     bpf_get_current_comm(&data->comm, sizeof(data->comm));
-    bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->pathname);
     
-    if (args->flag & AT_REMOVEDIR) {
-        __builtin_memcpy(&data->operation, "rmdir", 6);
-        data->is_dir = 1;
-    } else {
-        __builtin_memcpy(&data->operation, "unlink", 7);
-        data->is_dir = 0;
+    if (args->pathname) {
+        int ret = bpf_probe_read_user_str(&data->fname, sizeof(data->fname), (void *)args->pathname);
+        if (ret < 0) {
+            bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->pathname);
+        }
     }
     
-    file_events.perf_submit(args, data, sizeof(*data));
-    
-    return 0;
-}
-
-TRACEPOINT_PROBE(syscalls, sys_enter_mkdir) {
-    u32 zero = 0;
-    struct file_data_t *data = tmp_storage.lookup(&zero);
-    if (!data)
-        return 0;
-    
-    data->pid = bpf_get_current_pid_tgid() >> 32;
-    
-    bpf_get_current_comm(&data->comm, sizeof(data->comm));
-    bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->pathname);
-    __builtin_memcpy(&data->operation, "mkdir", 6);
-    data->is_dir = 1;
-    
-    file_events.perf_submit(args, data, sizeof(*data));
-    
-    return 0;
-}
-
-TRACEPOINT_PROBE(syscalls, sys_enter_mkdirat) {
-    u32 zero = 0;
-    struct file_data_t *data = tmp_storage.lookup(&zero);
-    if (!data)
-        return 0;
-    
-    data->pid = bpf_get_current_pid_tgid() >> 32;
-    
-    bpf_get_current_comm(&data->comm, sizeof(data->comm));
-    bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->pathname);
-    __builtin_memcpy(&data->operation, "mkdir", 6);
-    data->is_dir = 1;
-    
-    file_events.perf_submit(args, data, sizeof(*data));
-    
-    return 0;
-}
-
-TRACEPOINT_PROBE(syscalls, sys_enter_rmdir) {
-    u32 zero = 0;
-    struct file_data_t *data = tmp_storage.lookup(&zero);
-    if (!data)
-        return 0;
-    
-    data->pid = bpf_get_current_pid_tgid() >> 32;
-    
-    bpf_get_current_comm(&data->comm, sizeof(data->comm));
-    bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->pathname);
-    __builtin_memcpy(&data->operation, "rmdir", 6);
-    data->is_dir = 1;
+    __builtin_memcpy(&data->operation, "unlink", 7);
     
     file_events.perf_submit(args, data, sizeof(*data));
     
@@ -250,12 +422,21 @@ TRACEPOINT_PROBE(syscalls, sys_enter_rename) {
     if (!data)
         return 0;
     
-    data->pid = bpf_get_current_pid_tgid() >> 32;
+    __builtin_memset(data, 0, sizeof(*data));
+    
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    data->pid = pid_tgid >> 32;
     
     bpf_get_current_comm(&data->comm, sizeof(data->comm));
-    bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->oldname);
+    
+    if (args->oldname) {
+        int ret = bpf_probe_read_user_str(&data->fname, sizeof(data->fname), (void *)args->oldname);
+        if (ret < 0) {
+            bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->oldname);
+        }
+    }
+    
     __builtin_memcpy(&data->operation, "rename", 7);
-    data->is_dir = 0xFF;  
     
     file_events.perf_submit(args, data, sizeof(*data));
     
@@ -268,12 +449,21 @@ TRACEPOINT_PROBE(syscalls, sys_enter_renameat) {
     if (!data)
         return 0;
     
-    data->pid = bpf_get_current_pid_tgid() >> 32;
+    __builtin_memset(data, 0, sizeof(*data));
+    
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    data->pid = pid_tgid >> 32;
     
     bpf_get_current_comm(&data->comm, sizeof(data->comm));
-    bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->oldname);
+    
+    if (args->oldname) {
+        int ret = bpf_probe_read_user_str(&data->fname, sizeof(data->fname), (void *)args->oldname);
+        if (ret < 0) {
+            bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->oldname);
+        }
+    }
+    
     __builtin_memcpy(&data->operation, "rename", 7);
-    data->is_dir = 0xFF; 
     
     file_events.perf_submit(args, data, sizeof(*data));
     
@@ -286,72 +476,23 @@ TRACEPOINT_PROBE(syscalls, sys_enter_renameat2) {
     if (!data)
         return 0;
     
-    data->pid = bpf_get_current_pid_tgid() >> 32;
+    __builtin_memset(data, 0, sizeof(*data));
+    
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    data->pid = pid_tgid >> 32;
     
     bpf_get_current_comm(&data->comm, sizeof(data->comm));
-    bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->oldname);
+    
+    if (args->oldname) {
+        int ret = bpf_probe_read_user_str(&data->fname, sizeof(data->fname), (void *)args->oldname);
+        if (ret < 0) {
+            bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->oldname);
+        }
+    }
+    
     __builtin_memcpy(&data->operation, "rename", 7);
-    data->is_dir = 0xFF;
     
     file_events.perf_submit(args, data, sizeof(*data));
-    
-    return 0;
-}
-
-TRACEPOINT_PROBE(syscalls, sys_enter_getdents64) {
-    u64 pid_tgid = bpf_get_current_pid_tgid();
-    u32 pid = pid_tgid >> 32;
-    
-    struct fd_key_t key = {
-        .pid = pid,
-        .fd = (u32)args->fd
-    };
-    
-    u32 zero = 0;
-    struct file_data_t *data = tmp_storage.lookup(&zero);
-    if (!data)
-        return 0;
-    
-    struct file_data_t *info = fd_info.lookup(&key);
-    if (info != NULL) {
-        __builtin_memcpy(data, info, sizeof(*data));
-        
-        __builtin_memcpy(&data->operation, "readdir", 8);
-        data->is_dir = 1;
-        
-        bpf_get_current_comm(&data->comm, sizeof(data->comm));
-        
-        file_events.perf_submit(args, data, sizeof(*data));
-    }
-    
-    return 0;
-}
-
-TRACEPOINT_PROBE(syscalls, sys_enter_getdents) {
-    u64 pid_tgid = bpf_get_current_pid_tgid();
-    u32 pid = pid_tgid >> 32;
-    
-    struct fd_key_t key = {
-        .pid = pid,
-        .fd = (u32)args->fd
-    };
-    
-    u32 zero = 0;
-    struct file_data_t *data = tmp_storage.lookup(&zero);
-    if (!data)
-        return 0;
-    
-    struct file_data_t *info = fd_info.lookup(&key);
-    if (info != NULL) {
-        __builtin_memcpy(data, info, sizeof(*data));
-        
-        __builtin_memcpy(&data->operation, "readdir", 8);
-        data->is_dir = 1;  // This is definitely a directory operation
-        
-        bpf_get_current_comm(&data->comm, sizeof(data->comm));
-        
-        file_events.perf_submit(args, data, sizeof(*data));
-    }
     
     return 0;
 }
@@ -362,12 +503,21 @@ TRACEPOINT_PROBE(syscalls, sys_enter_chmod) {
     if (!data)
         return 0;
     
-    data->pid = bpf_get_current_pid_tgid() >> 32;
+    __builtin_memset(data, 0, sizeof(*data));
+    
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    data->pid = pid_tgid >> 32;
     
     bpf_get_current_comm(&data->comm, sizeof(data->comm));
-    bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->filename);
+    
+    if (args->filename) {
+        int ret = bpf_probe_read_user_str(&data->fname, sizeof(data->fname), (void *)args->filename);
+        if (ret < 0) {
+            bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->filename);
+        }
+    }
+    
     __builtin_memcpy(&data->operation, "chmod", 6);
-    data->is_dir = 0xFF;
     
     file_events.perf_submit(args, data, sizeof(*data));
     
@@ -380,12 +530,102 @@ TRACEPOINT_PROBE(syscalls, sys_enter_fchmodat) {
     if (!data)
         return 0;
     
-    data->pid = bpf_get_current_pid_tgid() >> 32;
+    __builtin_memset(data, 0, sizeof(*data));
+    
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    data->pid = pid_tgid >> 32;
     
     bpf_get_current_comm(&data->comm, sizeof(data->comm));
-    bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->filename);
+    
+    if (args->filename) {
+        int ret = bpf_probe_read_user_str(&data->fname, sizeof(data->fname), (void *)args->filename);
+        if (ret < 0) {
+            bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->filename);
+        }
+    }
+    
     __builtin_memcpy(&data->operation, "chmod", 6);
-    data->is_dir = 0xFF; 
+    
+    file_events.perf_submit(args, data, sizeof(*data));
+    
+    return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_enter_mkdir) {
+    u32 zero = 0;
+    struct file_data_t *data = tmp_storage.lookup(&zero);
+    if (!data)
+        return 0;
+    
+    __builtin_memset(data, 0, sizeof(*data));
+    
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    data->pid = pid_tgid >> 32;
+    
+    bpf_get_current_comm(&data->comm, sizeof(data->comm));
+    
+    if (args->pathname) {
+        int ret = bpf_probe_read_user_str(&data->fname, sizeof(data->fname), (void *)args->pathname);
+        if (ret < 0) {
+            bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->pathname);
+        }
+    }
+    
+    __builtin_memcpy(&data->operation, "mkdir", 6);
+    
+    file_events.perf_submit(args, data, sizeof(*data));
+    
+    return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_enter_mkdirat) {
+    u32 zero = 0;
+    struct file_data_t *data = tmp_storage.lookup(&zero);
+    if (!data)
+        return 0;
+    
+    __builtin_memset(data, 0, sizeof(*data));
+    
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    data->pid = pid_tgid >> 32;
+    
+    bpf_get_current_comm(&data->comm, sizeof(data->comm));
+    
+    if (args->pathname) {
+        int ret = bpf_probe_read_user_str(&data->fname, sizeof(data->fname), (void *)args->pathname);
+        if (ret < 0) {
+            bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->pathname);
+        }
+    }
+    
+    __builtin_memcpy(&data->operation, "mkdir", 6);
+    
+    file_events.perf_submit(args, data, sizeof(*data));
+    
+    return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_enter_rmdir) {
+    u32 zero = 0;
+    struct file_data_t *data = tmp_storage.lookup(&zero);
+    if (!data)
+        return 0;
+    
+    __builtin_memset(data, 0, sizeof(*data));
+    
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    data->pid = pid_tgid >> 32;
+    
+    bpf_get_current_comm(&data->comm, sizeof(data->comm));
+    
+    if (args->pathname) {
+        int ret = bpf_probe_read_user_str(&data->fname, sizeof(data->fname), (void *)args->pathname);
+        if (ret < 0) {
+            bpf_probe_read_str(&data->fname, sizeof(data->fname), (void *)args->pathname);
+        }
+    }
+    
+    __builtin_memcpy(&data->operation, "rmdir", 6);
     
     file_events.perf_submit(args, data, sizeof(*data));
     
