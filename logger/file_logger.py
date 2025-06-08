@@ -33,7 +33,7 @@ class FileLogger:
         self.kafka.send(self.topic, payload)
 
     def start(self):
-        self.bpf["file_events"].open_perf_buffer(self.print_file_event, lost_cb=self.lost_event_callback, page_cnt=512)
+        self.bpf["file_events"].open_perf_buffer(self.print_file_event, lost_cb=self.lost_event_callback, page_cnt=2048)
         print("FileLogger started...")
 
         while not self.stop_event.is_set():
