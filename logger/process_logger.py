@@ -33,7 +33,7 @@ class ProcessLogger:
                 "event": event.event.decode('utf-8', 'replace')
             }
         }
-        self.kafka.send(self.topic, payload)
+        # self.kafka.send(self.topic, payload)
 
     def start(self):
         print("Process started...")
