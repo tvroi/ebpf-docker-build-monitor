@@ -34,7 +34,7 @@ class NetLogger:
                 "length": str(event.len) if event.len > 0 else "-"
             }
         }
-        self.kafka.send(self.topic, payload)
+        # self.kafka.send(self.topic, payload)
 
     def start(self):
         self.bpf["conn_events"].open_perf_buffer(self.print_event)
