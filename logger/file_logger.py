@@ -13,7 +13,10 @@ class FileLogger:
         self.topic = "log-file-operation"
         self.stop_event = stop_event
         self.hostname = hostname
-
+        
+    def lost_event_callback(self, lost):
+        print(f"Lost {lost} events")
+        
     def print_file_event(self, cpu, data, size):
         event = self.bpf["file_events"].event(data)
         payload = {
@@ -30,7 +33,7 @@ class FileLogger:
         self.kafka.send(self.topic, payload)
 
     def start(self):
-        self.bpf["file_events"].open_perf_buffer(self.print_file_event)
+        self.bpf["file_events"].open_perf_buffer(self.print_file_event, lost_cb=self.lost_event_callback, page_cnt=512)
         print("FileLogger started...")
 
         while not self.stop_event.is_set():
